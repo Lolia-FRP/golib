@@ -25,6 +25,8 @@ import (
 )
 
 // Join two io.ReadWriteCloser and do some operations.
+// Data is relayed with adaptively sized copy buffers (see copyAdaptive), or
+// in-kernel via splice(2) when both ends are raw TCP/Unix connections.
 func Join(c1 io.ReadWriteCloser, c2 io.ReadWriteCloser) (inCount int64, outCount int64, errors []error) {
 	var wait sync.WaitGroup
 	recordErrs := make([]error, 2)
@@ -33,9 +35,7 @@ func Join(c1 io.ReadWriteCloser, c2 io.ReadWriteCloser) (inCount int64, outCount
 		defer to.Close()
 		defer from.Close()
 
-		buf := pool.GetBuf(16 * 1024)
-		defer pool.PutBuf(buf)
-		*count, recordErrs[number] = io.CopyBuffer(to, from, buf)
+		*count, recordErrs[number] = copyConn(to, from)
 	}
 
 	wait.Add(2)
