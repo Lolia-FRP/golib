@@ -169,7 +169,7 @@ func TestCopyAdaptiveGrowsAndShrinks(t *testing.T) {
 	}
 	src := &scriptedReader{script: script}
 
-	written, err := copyAdaptive(io.Discard, src)
+	written, err := copyAdaptive(io.Discard, src, len(bufSizes)-1)
 	require.NoError(t, err)
 
 	var want []int
@@ -194,11 +194,32 @@ func TestCopyAdaptiveGrowsAndShrinks(t *testing.T) {
 func TestCopyAdaptiveNeedsConsecutiveFullReads(t *testing.T) {
 	// Alternating full and small reads must never grow the buffer.
 	src := &scriptedReader{script: []int{fillRead, 100, fillRead, 100, fillRead}}
-	_, err := copyAdaptive(io.Discard, src)
+	_, err := copyAdaptive(io.Discard, src, len(bufSizes)-1)
 	require.NoError(t, err)
 	for i, size := range src.observed {
 		require.Equal(t, 4*1024, size, "read %d should still use the bottom tier", i)
 	}
+}
+
+func TestCopyAdaptiveRespectsMaxTier(t *testing.T) {
+	script := make([]int, 10)
+	for i := range script {
+		script[i] = fillRead
+	}
+	src := &scriptedReader{script: script}
+	_, err := copyAdaptive(io.Discard, src, streamMaxTier)
+	require.NoError(t, err)
+	for i, size := range src.observed {
+		require.LessOrEqual(t, size, bufSizes[streamMaxTier], "read %d exceeded the capped tier", i)
+	}
+	require.Equal(t, bufSizes[streamMaxTier], src.observed[len(src.observed)-1])
+}
+
+func TestMaxTierFor(t *testing.T) {
+	c1, _ := tcpPair(t)
+	require.Equal(t, len(bufSizes)-1, maxTierFor(c1), "raw sockets get the full range")
+	require.Equal(t, streamMaxTier, maxTierFor(wrappedConn{c1}), "wrapped streams are capped")
+	require.Equal(t, streamMaxTier, maxTierFor(io.Discard))
 }
 
 // joinFixed16k replicates the previous Join implementation (a fixed 16 KiB

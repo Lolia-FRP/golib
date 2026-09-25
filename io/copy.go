@@ -33,6 +33,14 @@ const (
 	// shrinkAfterSmallReads is how many consecutive reads fitting in the tier
 	// below (at most a quarter of the current buffer) before stepping down.
 	shrinkAfterSmallReads = 16
+	// streamMaxTier caps the buffer tier when the destination is not a raw
+	// socket. Such destinations are usually multiplexed streams (yamux over
+	// tcpMux, optionally wrapped by encryption/compression) where each Write
+	// becomes one frame in a send queue shared with every other stream and
+	// with keepalive pings. Frames larger than upstream's fixed 16 KiB let a
+	// few bulk streams delay those pings past the mux keepalive timeout on a
+	// slow link, which tears down the whole session.
+	streamMaxTier = 1
 )
 
 // bufPools holds one pool per tier. Pointers are pooled instead of slices to
@@ -58,7 +66,17 @@ func copyConn(dst io.Writer, src io.Reader) (int64, error) {
 	if spliceCapable(dst) && spliceCapable(src) {
 		return io.Copy(dst, src)
 	}
-	return copyAdaptive(dst, src)
+	return copyAdaptive(dst, src, maxTierFor(dst))
+}
+
+// maxTierFor returns the largest buffer tier copyAdaptive may use when
+// writing to dst. Only raw sockets, whose kernel send buffer absorbs large
+// writes without starving anyone else, get the full range.
+func maxTierFor(dst io.Writer) int {
+	if spliceCapable(dst) {
+		return len(bufSizes) - 1
+	}
+	return streamMaxTier
 }
 
 func spliceCapable(v any) bool {
@@ -74,7 +92,8 @@ func spliceCapable(v any) bool {
 // between reads based on how much of it recent reads used. Buffers grow while
 // a connection sustains bulk transfers and shrink back once traffic turns
 // small, so idle or interactive connections pin little memory while
-// high-throughput streams get large reads and fewer syscalls.
+// high-throughput streams get large reads and fewer syscalls. The buffer never
+// grows past bufSizes[maxTier].
 //
 // It deliberately does not delegate to io.CopyBuffer: that would take the
 // WriterTo/ReaderFrom fast paths whenever one endpoint is a raw *net.TCPConn,
@@ -82,7 +101,7 @@ func spliceCapable(v any) bool {
 // fixed 32 KiB stdlib buffer allocated per connection, defeating adaptive
 // sizing. The genuinely useful kernel fast path (both endpoints raw) is
 // handled by copyConn before this function is reached.
-func copyAdaptive(dst io.Writer, src io.Reader) (written int64, err error) {
+func copyAdaptive(dst io.Writer, src io.Reader, maxTier int) (written int64, err error) {
 	tier := 0
 	bufPtr := bufPools[tier].Get().(*[]byte)
 	defer func() {
@@ -115,7 +134,7 @@ func copyAdaptive(dst io.Writer, src io.Reader) (written int64, err error) {
 			case nr == len(buf):
 				smallReads = 0
 				fullReads++
-				if fullReads >= growAfterFullReads && tier < len(bufPools)-1 {
+				if fullReads >= growAfterFullReads && tier < maxTier {
 					bufPools[tier].Put(bufPtr)
 					tier++
 					bufPtr = bufPools[tier].Get().(*[]byte)
